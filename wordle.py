@@ -1,10 +1,9 @@
-# wordle_ui.py
-# Python 3.x - Tkinter UI Wordle (5 harf, 6 deneme)
-# UI klavye ile input; grid + klavye Wordle renkleri.
-# Yeni Oyun butonu + messagebox yerine status bar
-
+import math
+import time
 import random
 import tkinter as tk
+from collections import defaultdict
+from pathlib import Path
 
 # -----------------------------
 # Ayarlar
@@ -25,15 +24,38 @@ COL_KEY_DEFAULT = "#818384"
 COL_KEY_TEXT = "#FFFFFF"
 COL_KEY_SPECIAL = "#565758"
 
-WORDS = [
-    "APPLE", "TRAIN", "PLANT", "BRICK", "CLOUD", "SHEEP", "STONE", "GRAPE",
-    "LIGHT", "MOUSE", "SOUND", "WATER", "EARTH", "RIVER", "HOUSE", "BREAD",
-    "SMILE", "HEART", "NURSE", "SMART", "CHAIR", "SUGAR", "BLADE", "FROST",
-    "SHARK", "THING", "BRAVE", "CROWN", "SPICE", "SWEET", "TRACK", "SCOPE",
-]
-WORDS = [w for w in WORDS if len(w) == WORD_LENGTH and w.isalpha()]
-
 KB_ROWS = ["QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"]
+
+
+def load_words(file_name: str = "eng_dict.txt"):
+
+    file_path = Path(__file__).resolve().parent / file_name
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Kelime dosyası bulunamadı: {file_path}\n"
+            f"Lütfen '{file_name}' dosyasını wordle_ui.py ile aynı klasöre koyun."
+        )
+
+    content = file_path.read_text(encoding="utf-8")
+
+    words = []
+    for raw_word in content.splitlines():
+        word = raw_word.strip().upper()
+        if len(word) == WORD_LENGTH and word.isalpha():
+            words.append(word)
+
+    words = sorted(set(words))
+
+    if not words:
+        raise ValueError(
+            f"{file_name} dosyasından geçerli {WORD_LENGTH} harfli kelime yüklenemedi."
+        )
+
+    return words
+
+
+WORDS = load_words()
 
 
 def evaluate_guess(guess: str, answer: str):
@@ -80,15 +102,15 @@ def key_color(state: str) -> str:
 class WordleUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Wordle (UI)")
+        self.root.title("Wordle")
         self.root.configure(bg=COL_BG)
         self.root.resizable(False, False)
 
         if not WORDS:
-            raise ValueError("WORDS listesi boş. 5 harfli kelimeler ekleyin.")
+            raise ValueError("WORDS listesi boş. eng_dict.txt içeriğini kontrol edin.")
 
-        # Status bar timer
         self._status_after_id = None
+        self.feedback_cache = {}
 
         self._build_topbar()
         self._build_grid()
@@ -100,30 +122,167 @@ class WordleUI:
         self.new_game()
 
     # -----------------------------
-    # UI Build
+    # AI / Entropy
     # -----------------------------
+    def _feedback_pattern(self, guess: str, target: str):
+        key = (guess, target)
+        cached = self.feedback_cache.get(key)
+        if cached is not None:
+            return cached
+
+        pattern = tuple(evaluate_guess(guess, target))
+        self.feedback_cache[key] = pattern
+        return pattern
+
+    def _get_candidates(self):
+        candidates = []
+        for word in WORDS:
+            is_valid = True
+            for past_guess, past_states in self.history:
+                if self._feedback_pattern(past_guess, word) != tuple(past_states):
+                    is_valid = False
+                    break
+            if is_valid:
+                candidates.append(word)
+        return candidates
+
+    def _entropy_score(self, guess: str, candidates):
+        buckets = defaultdict(int)
+
+        for target in candidates:
+            pattern = self._feedback_pattern(guess, target)
+            buckets[pattern] += 1
+
+        total = len(candidates)
+        entropy = 0.0
+        for count in buckets.values():
+            p = count / total
+            entropy -= p * math.log2(p)
+
+        return entropy
+
+    def _best_entropy_guess(self, candidates):
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        best_guess = None
+        best_entropy = -1.0
+
+        # Deterministic olması için sıralı geziliyor.
+        # Guess uzayı olarak tüm sözlük kullanılıyor.
+        for guess in WORDS:
+            entropy = self._entropy_score(guess, candidates)
+
+            if entropy > best_entropy:
+                best_entropy = entropy
+                best_guess = guess
+            elif math.isclose(entropy, best_entropy, rel_tol=1e-12, abs_tol=1e-12):
+                # Eşit entropy durumunda kalan adaylardan birini tercih et,
+                # yine eşitse alfabetik küçük olanı seç.
+                if best_guess is None:
+                    best_guess = guess
+                else:
+                    guess_in_candidates = guess in candidates
+                    best_in_candidates = best_guess in candidates
+                    if guess_in_candidates and not best_in_candidates:
+                        best_guess = guess
+                    elif guess_in_candidates == best_in_candidates and guess < best_guess:
+                        best_guess = guess
+
+        return best_guess
+
+    def auto_guess(self):
+        if self.game_over:
+            return
+
+        if any(self.grid_letters[self.current_row][c] for c in range(WORD_LENGTH)):
+            self.set_status("Tahmin butonu için mevcut satır boş olmalı.", timeout_ms=2500)
+            return
+
+        start_time = time.time()
+
+        # İlk tahmin: hesaplama yapmadan SOARE
+        if not self.history:
+            guess = "SOARE"
+        else:
+            candidates = self._get_candidates()
+            if not candidates:
+                self.set_status("Aday kelime kalmadı. Önceki bilgiler tutarsız olabilir.", timeout_ms=3000)
+                return
+
+            guess = self._best_entropy_guess(candidates)
+            if not guess:
+                self.set_status("Tahmin üretilemedi.", timeout_ms=2500)
+                return
+
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"[Tahmin Süresi] {guess}: {duration:.6f} saniye")
+
+        for i, ch in enumerate(guess):
+            self.grid_letters[self.current_row][i] = ch
+            self._update_tile(self.current_row, i, ch)
+
+        self.current_col = WORD_LENGTH
+        self.on_enter()
+
+        if not self.game_over and self.history:
+            self.set_status(
+                f"Entropy tahmini oynandı: {guess} | Kalan aday: {len(self._get_candidates())}",
+                timeout_ms=2500,
+            )
+
     def _build_topbar(self):
         top = tk.Frame(self.root, bg=COL_BG)
         top.pack(fill="x", padx=14, pady=(12, 6))
 
         title = tk.Label(
-            top, text="WORDLE",
-            bg=COL_BG, fg=COL_TEXT,
+            top,
+            text="WORDLE",
+            bg=COL_BG,
+            fg=COL_TEXT,
             font=("Helvetica", 16, "bold")
         )
         title.pack(side="left")
 
+        controls = tk.Frame(top, bg=COL_BG)
+        controls.pack(side="right")
+
         self.btn_new = tk.Button(
-            top, text="Yeni Oyun",
+            controls,
+            text="New Game",
             command=self.new_game,
-            bg=COL_KEY_SPECIAL, fg=COL_KEY_TEXT,
-            activebackground=COL_KEY_SPECIAL, activeforeground=COL_KEY_TEXT,
-            bd=0, relief="flat",
+            bg=COL_KEY_SPECIAL,
+            fg=COL_KEY_TEXT,
+            activebackground=COL_KEY_SPECIAL,
+            activeforeground=COL_KEY_TEXT,
+            bd=0,
+            relief="flat",
             font=("Helvetica", 10, "bold"),
             cursor="hand2",
-            padx=12, pady=6
+            padx=12,
+            pady=6
         )
-        self.btn_new.pack(side="right")
+        self.btn_new.pack(fill="x", pady=(0, 6))
+
+        self.btn_guess = tk.Button(
+            controls,
+            text="Guess",
+            command=self.auto_guess,
+            bg=COL_KEY_SPECIAL,
+            fg=COL_KEY_TEXT,
+            activebackground=COL_KEY_SPECIAL,
+            activeforeground=COL_KEY_TEXT,
+            bd=0,
+            relief="flat",
+            font=("Helvetica", 10, "bold"),
+            cursor="hand2",
+            padx=12,
+            pady=6
+        )
+        self.btn_guess.pack(fill="x")
 
     def _build_grid(self):
         frame = tk.Frame(self.root, bg=COL_BG)
@@ -162,11 +321,17 @@ class WordleUI:
         row3.grid(row=2, column=0, pady=6)
 
         self.btn_enter = tk.Button(
-            row3, text="ENTER",
+            row3,
+            text="ENTER",
             command=self.on_enter,
-            bg=COL_KEY_SPECIAL, fg=COL_KEY_TEXT,
-            activebackground=COL_KEY_SPECIAL, activeforeground=COL_KEY_TEXT,
-            width=7, height=2, bd=0, relief="flat",
+            bg=COL_KEY_SPECIAL,
+            fg=COL_KEY_TEXT,
+            activebackground=COL_KEY_SPECIAL,
+            activeforeground=COL_KEY_TEXT,
+            width=7,
+            height=2,
+            bd=0,
+            relief="flat",
             font=("Helvetica", 10, "bold"),
             cursor="hand2"
         )
@@ -174,11 +339,17 @@ class WordleUI:
 
         for ch in KB_ROWS[2]:
             b = tk.Button(
-                row3, text=ch,
+                row3,
+                text=ch,
                 command=lambda x=ch: self.on_letter(x),
-                bg=COL_KEY_DEFAULT, fg=COL_KEY_TEXT,
-                activebackground=COL_KEY_DEFAULT, activeforeground=COL_KEY_TEXT,
-                width=4, height=2, bd=0, relief="flat",
+                bg=COL_KEY_DEFAULT,
+                fg=COL_KEY_TEXT,
+                activebackground=COL_KEY_DEFAULT,
+                activeforeground=COL_KEY_TEXT,
+                width=4,
+                height=2,
+                bd=0,
+                relief="flat",
                 font=("Helvetica", 11, "bold"),
                 cursor="hand2"
             )
@@ -186,11 +357,17 @@ class WordleUI:
             self.key_buttons[ch] = b
 
         self.btn_bk = tk.Button(
-            row3, text="⌫",
+            row3,
+            text="⌫",
             command=self.on_backspace,
-            bg=COL_KEY_SPECIAL, fg=COL_KEY_TEXT,
-            activebackground=COL_KEY_SPECIAL, activeforeground=COL_KEY_TEXT,
-            width=5, height=2, bd=0, relief="flat",
+            bg=COL_KEY_SPECIAL,
+            fg=COL_KEY_TEXT,
+            activebackground=COL_KEY_SPECIAL,
+            activeforeground=COL_KEY_TEXT,
+            width=5,
+            height=2,
+            bd=0,
+            relief="flat",
             font=("Helvetica", 12, "bold"),
             cursor="hand2"
         )
@@ -202,11 +379,17 @@ class WordleUI:
 
         for ch in letters:
             b = tk.Button(
-                rowf, text=ch,
+                rowf,
+                text=ch,
                 command=lambda x=ch: self.on_letter(x),
-                bg=COL_KEY_DEFAULT, fg=COL_KEY_TEXT,
-                activebackground=COL_KEY_DEFAULT, activeforeground=COL_KEY_TEXT,
-                width=4, height=2, bd=0, relief="flat",
+                bg=COL_KEY_DEFAULT,
+                fg=COL_KEY_TEXT,
+                activebackground=COL_KEY_DEFAULT,
+                activeforeground=COL_KEY_TEXT,
+                width=4,
+                height=2,
+                bd=0,
+                relief="flat",
                 font=("Helvetica", 11, "bold"),
                 cursor="hand2"
             )
@@ -236,17 +419,16 @@ class WordleUI:
         self.current_row = 0
         self.current_col = 0
         self.game_over = False
+        self.history = []
 
         self.grid_letters = [["" for _ in range(WORD_LENGTH)] for _ in range(MAX_GUESSES)]
         self.key_state = {ch: "default" for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
 
-        # Grid temizle
         for r in range(MAX_GUESSES):
             for c in range(WORD_LENGTH):
                 lbl = self.tiles[r][c]
                 lbl.config(text="", bg=COL_EMPTY_TILE, fg=COL_TEXT, highlightbackground=COL_TILE_BORDER)
 
-        # Klavye temizle
         for ch, btn in self.key_buttons.items():
             btn.config(bg=COL_KEY_DEFAULT, activebackground=COL_KEY_DEFAULT)
 
@@ -256,7 +438,6 @@ class WordleUI:
     # Status bar
     # -----------------------------
     def set_status(self, msg: str, timeout_ms: int = 0):
-        # Eski timer varsa iptal et
         if self._status_after_id is not None:
             try:
                 self.root.after_cancel(self._status_after_id)
@@ -327,6 +508,8 @@ class WordleUI:
             return
 
         states = evaluate_guess(guess, self.answer)
+        self.history.append((guess, tuple(states)))
+
         self._apply_row_colors(self.current_row, states)
         self._apply_keyboard_colors(guess, states)
 
